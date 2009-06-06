@@ -40,7 +40,6 @@ namespace VideosLibraryPlugin
     public class VideosLibrary : BaseButtonListUiTask, IUiPopupCallback, SkinHelper2.GetImageCallback
     {
         protected const int IMG_CACHE_LEN = 50;
-        //protected const int IMG_COMPRESSION = 35;
         protected const float RELOAD_TIMEOUT = 180;
         protected const float WATCHED_PADDING = 10;
         protected const string UP_ENTRY_KEY = "upEntry";
@@ -54,7 +53,7 @@ namespace VideosLibraryPlugin
         protected bool confirmDelete;// = true;
         protected bool hybridViewMode;// = false;
         protected bool bracketDirNames;// = true;
-        protected bool onlyDirsWithVids;// = false;
+        protected static bool onlyDirsWithVids;// = false; //TEMP STATIC
         protected bool strictFolderMetadata;// = false;
         protected bool showPlay, showMode, showSort, showPlayAll, showDelete, showMainMenu;
 
@@ -80,7 +79,7 @@ namespace VideosLibraryPlugin
         protected IPluginHelper pluginHelper = null;
         protected KeyCommandHelper keyHelper = null;
         protected FileSystemWatcher fileWatcher = null;
-        protected static DbConnection dbConnection = null; //temp static
+        protected static DbConnection dbConnection = null; //TEMP STATIC
         protected Dictionary<string, bool> options = null;
         protected Dictionary<ViewMode, int> viewCounts = null;
         protected List<KeyValuePair<Command, string>> commands = null;
@@ -95,8 +94,11 @@ namespace VideosLibraryPlugin
         
 
         //TEMP IMPL
+        protected List<FileSystemWatcher> fileWatchers = new List<FileSystemWatcher>();
         protected Dictionary<string, Playback> playbackCache = new Dictionary<string, Playback>();
         static protected string picExtensions = @"^.+\.(bmp|jpg|png|tiff)$";
+        static Dictionary<string, List<FileSystemInfo>> fileSystemCache =
+            new Dictionary<string, List<FileSystemInfo>>();
 
 
 
@@ -154,6 +156,7 @@ namespace VideosLibraryPlugin
         }
 
 
+        //MUTABLE -> CHANGE TO CLASS
         /// <summary>
         /// Represents an image; x and y will be either position or size values.
         /// The path list is all search paths that result in this image.
@@ -200,6 +203,8 @@ namespace VideosLibraryPlugin
         /// </summary>
         protected class EntryModel : List<KeyValuePair<string, Entry>>
         {
+            protected string CurrentDir = "";
+
             public int BottomIndex { get; set; }
             public int CurrentIndex { get; set; }
             public Entry CurrentEntry { get; set; }
@@ -223,7 +228,7 @@ namespace VideosLibraryPlugin
                 BottomIndex = 0;
                 CurrentIndex = 0;
                 CurrentEntry = null;
-                CurrentPath = "";
+                CurrentPath = null;
                 FileExtensions = "";
                 ShowExtensions = true;
                 NeedsRefreshing = true;
@@ -258,13 +263,12 @@ namespace VideosLibraryPlugin
 
             public string GetDirectory()
             {
-                return (FolderStack.Count == 0)
-                    ? TopDirs.First().Key : Directory.GetCurrentDirectory();
+                return CurrentDir;
             }
 
             public void SetDirectory(string cwd)
             {
-                Directory.SetCurrentDirectory(cwd);
+                CurrentDir = cwd;
             }
 
             public void PushLevel(string path)
@@ -279,7 +283,7 @@ namespace VideosLibraryPlugin
                 SetDirectory(path);
                 BottomIndex = 1;
                 CurrentIndex = 1;
-                CurrentPath = "";
+                CurrentPath = null;
             }
 
             public void PopLevel()
@@ -580,174 +584,244 @@ namespace VideosLibraryPlugin
 
 
         /// <summary>
-        /// Make sure the path is a valid directory (w/files if specified by config).
+        /// Make sure directory contents are cached then return them.
+        /// If the directory can't be read then null is returned.
         /// </summary>
-        protected static bool IsValidDir(string path, string fileRegex, bool requireVids)
+        protected static List<FileSystemInfo> GetPathInfosImpl(string dir)
         {
-            var info = new DirectoryInfo(path);
-            bool isDir = ((info.Attributes & FileAttributes.Directory) != 0);
-            bool isHidden = ((info.Attributes & FileAttributes.Hidden) != 0);
-            bool isSystem = ((info.Attributes & FileAttributes.System) != 0);
-            if (!isDir || isHidden || isSystem) return false;
-            else if (!requireVids) return true;
+            lock (fileSystemCache)
+            {
+                try
+                {
+                    if (!fileSystemCache.ContainsKey(dir))
+                        fileSystemCache[dir] = new DirectoryInfo(dir).GetFileSystemInfos().ToList();
+                }
+                catch (Exception e)
+                {
+                    Logger.Verbose("VideosLibrary::GetPathInfosImpl; " + e.Message);
+                    fileSystemCache[dir] = null;
+                }
+                return fileSystemCache[dir];
+            }
+        }
 
-            FileInfo[] files = null;
-            try { files = info.GetFiles(); }
-            catch (Exception e) { Logger.Verbose(e.Message); }
-            if (files == null) return false;
 
-            foreach (var file in files)
-                if (IsValidFile(file.FullName, fileRegex)) return true;
-            foreach (var dir in info.GetDirectories())
-                if (IsValidDir(dir.FullName, fileRegex, requireVids)) return true;
+        /// <summary>
+        /// Retrieve cached contents of a [file's] directory.
+        /// If the directory can't be read then null is returned.
+        /// </summary>
+        protected static List<FileSystemInfo> GetPathInfos(string path)
+        {
+            var info = GetPathInfo(path);
+            if (info is FileInfo)
+                info = GetPathInfo(Path.GetDirectoryName(info.FullName));
+            return GetPathInfosImpl(info.FullName);
+        }
+
+
+        /// <summary>
+        /// Retrieve cached file or directory info.
+        /// </summary>
+        protected static FileSystemInfo GetPathInfo(string path)
+        {
+            string dir = Path.GetDirectoryName(path);
+            if (dir == null)
+                return new DirectoryInfo(path);
+
+            ICollection<FileSystemInfo> infos = GetPathInfosImpl(dir);
+            if (infos != null && CheckPath(path, infos) == null)
+                infos.Add(new FileInfo(path));
+            return (infos == null ? new FileInfo(path) 
+                : infos.First(x => x.FullName == path));
+        }
+
+
+        /// <summary>
+        /// Return the path if it exists, otherwise return null;
+        /// </summary>
+        protected static string CheckPath<T>(string path, IEnumerable<T> infos) where T : FileSystemInfo
+        {
+            return (infos != null &&
+                (infos.Count(x => String.Compare(x.FullName, path, true) == 0) != 0)
+                ? path : null);
+        }
+
+
+        /// <summary>
+        /// Return a path which matches the regex and, ignoring extension, the file name.
+        /// If no such file is found, returns null.
+        /// </summary>
+        protected static string GetCongruentFile(string file, string regex, IEnumerable<FileInfo> files)
+        {
+            var imgFile = files.FirstOrDefault(x =>
+                Regex.IsMatch(x.Name, regex) &&
+                String.Compare
+                (Path.GetFileNameWithoutExtension(x.Name),
+                 Path.GetFileNameWithoutExtension(file), true) == 0);
+            return (imgFile != null ? imgFile.FullName : null);
+        }
+
+
+        /// <summary>
+        /// Make sure the path is an existent, valid directory.
+        /// Pass a fileRegex to check if the directory has valid files.
+        /// The checkRead flag will make sure that directory contents can be seen.
+        /// </summary>
+        protected static bool IsValidDir(string path, string fileRegex, bool checkRead)
+        {
+            var info = GetPathInfo(path);
+            if (info is DirectoryInfo)
+                return IsValidDir(new DirectoryInfo(path), fileRegex, checkRead);
+            return false;
+        }
+        protected static bool IsValidDir(DirectoryInfo dir, string fileRegex, bool checkRead)
+        {
+            bool isRoot = (dir.FullName == dir.Root.FullName);
+            bool isHidden = ((dir.Attributes & FileAttributes.Hidden) != 0);
+            bool isSystem = ((dir.Attributes & FileAttributes.System) != 0);
+            if (!dir.Exists || (!isRoot && (isHidden || isSystem))) return false;
+            if (!checkRead) return true;
+
+            List<FileSystemInfo> infos = GetPathInfos(dir.FullName);
+            if (infos == null) return false;
+            if (!onlyDirsWithVids) return true;
+
+            foreach (var file in infos.OfType<FileInfo>())
+                if (IsValidFile(file, fileRegex)) return true;
+            foreach (var subdir in infos.OfType<DirectoryInfo>())
+                if (IsValidDir(subdir, fileRegex, checkRead)) return true;
             return false;
         }
 
 
         /// <summary>
-        /// Make sure the path is a valid file as specified by config.
+        /// Make sure the path is an existent, valid file which matches the regex.
         /// </summary>
         protected static bool IsValidFile(string path, string fileRegex)
         {
-            var info = new FileInfo(path);
-            bool isFile = File.Exists(path);
-            bool isHidden = ((info.Attributes & FileAttributes.Hidden) != 0);
-            bool isMatch = Regex.IsMatch(path, fileRegex, RegexOptions.IgnoreCase);
-            return (isFile && !isHidden && isMatch);
+            var info = GetPathInfo(path);
+            return (info is FileInfo ? IsValidFile(new FileInfo(path), fileRegex) : false);
+        }
+        protected static bool IsValidFile(FileInfo file, string fileRegex)
+        {
+            bool isMatch = Regex.IsMatch(file.FullName, fileRegex, RegexOptions.IgnoreCase);
+            bool isHidden = ((file.Attributes & FileAttributes.Hidden) != 0);
+            return (file.Exists && isMatch && !isHidden);
         }
 
 
         /// <summary>
         /// Wrapper for the individual dir and file functions.
         /// </summary>
-        protected static bool IsValidDirOrFile(string path, string fileRegex, bool requireVids)
+        protected static bool IsValidPath(string path, string fileRegex, bool checkRead)
         {
-            return (Directory.Exists(path)
-                ? IsValidDir(path, fileRegex, requireVids)
-                : IsValidFile(path, fileRegex));
+            return IsValidPath(GetPathInfo(path), fileRegex, checkRead);
         }
-
-
-        /// <summary>
-        /// Find the first file starting with a prefix and matching the regex.
-        /// </summary>
-        protected static string FindFile(string dir, string filePrefix, string fileRegex)
+        protected static bool IsValidPath(FileSystemInfo info, string fileRegex, bool checkRead)
         {
-            string path = null;
-            foreach (var file in new DirectoryInfo(dir).GetFiles(filePrefix + "*"))
-            {
-                if (Regex.IsMatch(file.FullName, fileRegex))
-                {
-                    path = file.FullName;
-                    break;
-                }
-            }
-            return path;
+            return (info is FileInfo
+                ? IsValidFile((FileInfo)info, fileRegex)
+                : IsValidDir((DirectoryInfo)info, fileRegex, checkRead));
         }
-
 
         /// <summary>
         /// Find an xml file for the given video file or directory.
         /// If strict, only allow folder.xml for directories.
+        /// If no such file is found, returns null.
         /// </summary>
         protected static string FindXmlFile(string path, string fileRegex, bool strict)
         {
-            string xmlPath = null;
-            string dvdExt = ".dvd_";
-            if (Directory.Exists(path) && Path.GetFileName(path).Equals("VIDEO_TS"))
+            if (!IsValidPath(path, fileRegex, true))
+                return null;
+
+            bool isFile = (GetPathInfo(path) is FileInfo);
+            string dvdPath = Path.Combine(path, "VIDEO_TS");
+            if (!isFile && Directory.Exists(dvdPath))
+                return FindXmlFile(dvdPath, fileRegex, strict);
+            else if (!isFile && Path.GetFileName(path).Equals("VIDEO_TS"))
             {
+                isFile = true;
                 path = Path.GetDirectoryName(path);
-                path = Path.Combine(path, Path.GetFileName(path)) + dvdExt;
+                path = Path.Combine(path, Path.GetFileName(path)) + ".dvd_";
             }
 
-            bool isFile = (File.Exists(path) || path.EndsWith(dvdExt));
+            string xmlPath = null;
+            string dir = (isFile ? Path.GetDirectoryName(path) : path);
+            var files = (GetPathInfos(path) ?? new List<FileSystemInfo>()).OfType<FileInfo>();
             if (isFile)
-            {
                 xmlPath = Path.ChangeExtension(path, ".xml");
-                path = Path.GetDirectoryName(path);
-            }
             else
             {
-                string dvdPath = Path.Combine(path, "VIDEO_TS");
-                if (Directory.Exists(dvdPath))
-                    return FindXmlFile(dvdPath, fileRegex, strict);
-
                 xmlPath = Path.Combine(path, "Folder.xml");
-                if (!File.Exists(xmlPath) && !strict)
+                if (CheckPath(xmlPath, files) == null && !strict)
                 {
-                    foreach (var file in new DirectoryInfo(path).GetFiles())
+                    foreach (var file in files)
                     {
                         if (IsValidFile(file.FullName, fileRegex))
                         {
                             xmlPath = Path.ChangeExtension(file.FullName, "xml");
-                            if (!File.Exists(xmlPath)) xmlPath = null;
-                            else break;
+                            xmlPath = CheckPath(xmlPath, files);
+                            if (xmlPath != null) break;
                         }
                     }
                 }
             }
 
-            if (!File.Exists(xmlPath) && ((isFile || !strict)))
-                xmlPath = Path.Combine(path, "MyMovies.xml");
-            return (File.Exists(xmlPath) ? xmlPath : null);
+            if (CheckPath(xmlPath, files) == null && (isFile || !strict))
+                xmlPath = Path.Combine(dir, "MyMovies.xml");
+            return CheckPath(xmlPath, files);
         }
 
 
         /// <summary>
         /// Find cover art for a given video file or directory.
         /// If strict, only allow folder.jpg (or a metadata-specific image) for directories.
+        /// If no such file is found, returns null.
         /// </summary>
         protected static string FindCoverArt(string path, string fileRegex, bool strict)
         {
-            string imgPath = null;
-            string dvdExt = ".dvd_";
-            if (Directory.Exists(path) && Path.GetFileName(path).Equals("VIDEO_TS"))
+            if (!IsValidPath(path, fileRegex, true))
+                return null;
+
+            bool isFile = (GetPathInfo(path) is FileInfo);
+            string dvdPath = Path.Combine(path, "VIDEO_TS");
+            if (!isFile && Directory.Exists(dvdPath))
+                return FindCoverArt(dvdPath, fileRegex, strict);
+            else if (!isFile && Path.GetFileName(path).Equals("VIDEO_TS"))
             {
+                isFile = true;
                 path = Path.GetDirectoryName(path);
-                path = Path.Combine(path, Path.GetFileName(path)) + dvdExt;
+                path = Path.Combine(path, Path.GetFileName(path)) + ".dvd_";
             }
 
+            string imgPath = null;
             var metadata = new Hashtable();
-            string xmlPath = FindXmlFile(path, fileRegex, strict);
-            bool isFile = (File.Exists(path) || path.EndsWith(dvdExt));
-            if (GetXmlMetadata(metadata, xmlPath))
+            string dir = (isFile ? Path.GetDirectoryName(path) : path);
+            var files = (GetPathInfos(path) ?? new List<FileSystemInfo>()).OfType<FileInfo>();
+            if (GetXmlMetadata(metadata, FindXmlFile(path, fileRegex, strict)))
             {
-                string dir = (isFile ? Path.GetDirectoryName(path) : path);
                 imgPath = metadata[IMG_PATH_KEY].ToString();
-                if (!File.Exists(imgPath))
-                    imgPath = Path.Combine(dir, imgPath);
-                if (File.Exists(imgPath))
+                imgPath = CheckPath(imgPath, files) ?? Path.Combine(dir, imgPath);
+                if (CheckPath(imgPath, files) != null)
                     return imgPath;
             }
 
             if (isFile)
-            {
-                string dir = Path.GetDirectoryName(path);
-                string prefix = Path.GetFileNameWithoutExtension(path);
-                imgPath = FindFile(dir, prefix, picExtensions);
-            }
+                imgPath = GetCongruentFile(path, picExtensions, files);
             else
             {
-                string dvdPath = Path.Combine(path, "VIDEO_TS");
-                if (Directory.Exists(dvdPath))
-                    return FindCoverArt(dvdPath, fileRegex, strict);
-
-                imgPath = FindFile(path, "Folder", picExtensions);
-                if (!File.Exists(imgPath) && !strict)
+                imgPath = GetCongruentFile("Folder", picExtensions, files);
+                if (imgPath == null && !strict)
                 {
-                    foreach (var file in new DirectoryInfo(path).GetFiles())
+                    foreach (var file in files)
                     {
                         if (IsValidFile(file.FullName, fileRegex))
-                        {
-                            string prefix = Path.GetFileNameWithoutExtension(file.FullName);
-                            imgPath = FindFile(path, prefix, picExtensions);
-                            if (!File.Exists(imgPath)) imgPath = null;
-                            else break;
-                        }
+                            imgPath = GetCongruentFile(file.Name, picExtensions, files);
+                        if (imgPath != null) break;
                     }
                 }
             }
-            return (File.Exists(imgPath) ? imgPath : null);
+            return imgPath;
         }
 
 
@@ -821,6 +895,8 @@ namespace VideosLibraryPlugin
                 string path = dirs[i].Substring(pathIdx + 1);
                 entryModel.TopDirs.Add(MakePair(path, name));
             }
+            if (entryModel.TopDirs.Count == 1)
+                entryModel.SetDirectory(entryModel.TopDirs[0].Key);
 
             return dict;
         }
@@ -832,13 +908,25 @@ namespace VideosLibraryPlugin
         protected void WatcherInit(string path)
         {
             Logger.Verbose("VideosLibrary::WatcherInit; " + path);
-            fileWatcher = new FileSystemWatcher(path);
-            fileWatcher.Created += WatcherAction;
-            fileWatcher.Deleted += WatcherAction;
-            fileWatcher.Renamed += WatcherAction;
-            fileWatcher.Error += WatcherError;
-            fileWatcher.IncludeSubdirectories = false;
-            fileWatcher.EnableRaisingEvents = true;
+            int idx = fileWatchers.FindIndex(x => path.Contains(x.Path));
+            if (idx >= 0)
+            {
+                if (fileWatchers[idx].EnableRaisingEvents)
+                    return;
+                path = fileWatchers[idx].Path;
+                fileWatchers[idx].Dispose();
+                fileWatchers.RemoveAt(idx);
+            }
+            try { fileWatchers.Add(new FileSystemWatcher(path)); }
+            catch (Exception e) { Logger.Verbose("VideosLibrary::WatcherInit; " + e.Message); return; }
+
+            var watcher = fileWatchers.Last();
+            watcher.Created += WatcherAction;
+            watcher.Deleted += WatcherAction;
+            watcher.Renamed += WatcherAction;
+            watcher.Error += WatcherError;
+            watcher.IncludeSubdirectories = true;
+            watcher.EnableRaisingEvents = true;
         }
 
 
@@ -848,13 +936,32 @@ namespace VideosLibraryPlugin
         protected void WatcherAction(Object sender, FileSystemEventArgs e)
         {
             Logger.Verbose("VideosLibrary::WatcherAction; " + e.ChangeType + ", " + e.FullPath);
-            if (false && e.ChangeType == WatcherChangeTypes.Deleted)
+            lock (fileSystemCache)
             {
-                //possibly already deleted if done in gui... ///////////////////////////////////////matching locks elsewhere?
-                lock (entryModel) entryModel.Remove(e.FullPath);
-                entryModel.NeedsRefreshing = true;
+                string baseDir = Path.GetDirectoryName(e.FullPath);
+                if (e.ChangeType == WatcherChangeTypes.Created)
+                {
+                    FileSystemInfo info = (Directory.Exists(e.FullPath)
+                        ? (FileSystemInfo)new DirectoryInfo(e.FullPath)
+                        : (FileSystemInfo)new FileInfo(e.FullPath));
+                    if (fileSystemCache.ContainsKey(baseDir))
+                        fileSystemCache[baseDir].Add(info);
+                }
+                else if (e.ChangeType == WatcherChangeTypes.Deleted)
+                {
+                    fileSystemCache.Remove(e.FullPath);
+                    if (fileSystemCache.ContainsKey(baseDir))
+                        fileSystemCache[baseDir].RemoveAll(x => x.FullName == e.FullPath);
+                }
+                else if (fileSystemCache.ContainsKey(baseDir))
+                {
+                    fileSystemCache[baseDir] = new DirectoryInfo(baseDir).GetFileSystemInfos().ToList();
+                }
             }
-            else entryModel.NeedsReloading = true;
+
+            //REFRESH IMG CACHE WHERE NECESSARY
+
+            entryModel.NeedsReloading = true;
         }
 
 
@@ -863,14 +970,17 @@ namespace VideosLibraryPlugin
         /// </summary>
         protected void WatcherError(Object sender, ErrorEventArgs e)
         {
-            fileWatcher = new FileSystemWatcher();
-            while (!fileWatcher.EnableRaisingEvents)
+            string path = ((FileSystemWatcher)sender).Path;
+            do
             {
-                try { WatcherInit(entryModel.CurrentPath); }
+                try { WatcherInit(path); }
                 catch { System.Threading.Thread.Sleep(5000); }
             }
-            entryModel.NeedsReloading = true;
+            while (!fileWatchers.First(x => path.Contains(x.Path)).EnableRaisingEvents);
+
             Logger.Verbose("VideosLibrary::WatcherError; " + e.GetException());
+            lock (fileSystemCache) fileSystemCache.Clear();
+            entryModel.NeedsReloading = true;
         }
 
 
@@ -975,12 +1085,15 @@ namespace VideosLibraryPlugin
             int dirCount = entryModel.GetFolderCount();
             for (int i = Math.Max(dirCount, start); i <= end && !foundNull; ++i)
             {
-                string path = entryModel[i].Key;
-                var entry = entryModel[i].Value;
-                foundNull = (entry.Status == Playback.NULL);
-                foundNull &= (!playbackCache.ContainsKey(path) || playbackCache[path] == Playback.NULL);
-                if (foundNull) entry.Status = playbackCache[path] = GetPlaybackStatus(path);
-                else entry.Status = playbackCache[path];
+                lock (playbackCache)
+                {
+                    string path = entryModel[i].Key;
+                    var entry = entryModel[i].Value;
+                    foundNull = (entry.Status == Playback.NULL);
+                    foundNull &= (!playbackCache.ContainsKey(path) || playbackCache[path] == Playback.NULL);
+                    if (foundNull) entry.Status = playbackCache[path] = GetPlaybackStatus(path);
+                    else entry.Status = playbackCache[path];
+                }
             }
             return foundNull;
         }
@@ -1002,11 +1115,11 @@ namespace VideosLibraryPlugin
                 }
 
                 dbConnection.Open();
-                while (path.Equals(entryModel.CurrentPath))
+                while (path == entryModel.CurrentPath)
                 {
                     lock (entryModel)
                     {
-                        if (path.Equals(entryModel.CurrentPath))
+                        if (path == entryModel.CurrentPath)
                         {
                             int viewCount = viewCounts[base.uiList.getViewMode()];
                             int top = entryModel.BottomIndex - viewCount;
@@ -1028,19 +1141,32 @@ namespace VideosLibraryPlugin
         /// </summary>
         protected void CacheImages()
         {
+            ImageInfo info = new ImageInfo();
             while (true)
             {
-                ImageInfo info;
                 lock (imgRequests)
                 {
-                    while (imgRequests.Count == 0)
+                    int prevIdx = imgRequests.IndexOf(info);
+                    while (prevIdx == imgRequests.Count - 1)
                         Monitor.Wait(imgRequests);
                     info = imgRequests[0];
                 }
-                CacheImage(info.Type, info.Paths[0], info.ValX, info.ValY);
-                lock (imgRequests) imgRequests.Remove(info);
+
+                Thread thread = new Thread(delegate()
+                    {
+                        CacheImage(info.Type, info.Paths[0], info.ValX, info.ValY);
+                        lock (imgRequests) imgRequests.Remove(info);
+                    });
+                thread.Priority = ThreadPriority.Lowest;
+                thread.IsBackground = true;
+                thread.Start();
+
+                string dir = entryModel.GetDirectory();
+                while (dir == entryModel.GetDirectory())
+                    if (thread.Join(50)) break;
             }
         }
+
 
 
 
@@ -1049,21 +1175,48 @@ namespace VideosLibraryPlugin
         //CLEAN UP
         protected void CacheImage(ImageType imgType, string path, int width, int height)
         {
-            Thread.Sleep(0);
-            bool dbg = false;
+            
+            bool dbg = true;
+            bool sleep = false;
+            if (sleep) Thread.Sleep(0);
+
+
+            var start_ = DateTime.Now;
+
+
 
             string imgPath = null;
-            bool isDvd = (Directory.Exists(path) && Path.GetFileName(path).Equals("VIDEO_TS"));
-            if (Regex.IsMatch(path, picExtensions, RegexOptions.IgnoreCase))
+            bool isFile = File.Exists(path);
+            bool isDvd = Path.GetFileName(path).Equals("VIDEO_TS");
+            if (isFile && Regex.IsMatch(path, picExtensions, RegexOptions.IgnoreCase))
                 imgPath = path;
             if (imgPath == null)
+            {
+                /*
+                string dir = (isFile || isDvd ? Path.GetDirectoryName(path) : path);
+                lock (fileSystemCache)
+                {
+                    if (IsValidDir(dir, null, true) && !fileSystemCache.ContainsKey(dir))
+                    {
+                        fileSystemCache[dir] = new DirectoryInfo(dir).GetFileSystemInfos().ToList();
+                        Logger.Verbose("__imageFileSystemCache: " + dir);
+                    }
+                }
+                */
+                //string fileRegex = (onlyDirsWithVids ? entryModel.FileExtensions : null);
                 imgPath = FindCoverArt(path, entryModel.FileExtensions, strictFolderMetadata);
-            if (!File.Exists(imgPath))
-                imgPath = (isDvd || File.Exists(path) ? fileImgPath : folderImgPath);
-            bool isNullImg = (!File.Exists(imgPath));
+
+            }
+            if (imgPath == null)
+                imgPath = (isFile || isDvd ? fileImgPath : folderImgPath);
+            //bool isNullImg = (!File.Exists(imgPath));
+            bool isNullImg = (imgPath == null || imgPath == "NULL.JPG");
 
 
-            Thread.Sleep(0);
+            Logger.Verbose("__FindImageTime: " + DateTime.Now.Subtract(start_).TotalMilliseconds);
+
+
+            if (sleep) Thread.Sleep(0);
             if (dbg) Logger.Verbose("__isNullImg: " + isNullImg + ", " + path);
             if (dbg) Logger.Verbose("__imgNotCached: " + imgType + ", " + imgPath + ", " + width + "x" + height);
 
@@ -1077,7 +1230,7 @@ namespace VideosLibraryPlugin
                     var tagType = ((ImageInfo)imgCache[i].Tag).Type;
                     var tagPaths = ((ImageInfo)imgCache[i].Tag).Paths;
                     string tagImgPath = ((ImageInfo)imgCache[i].Tag).ImgPath;
-                    bool isSameImage = (tagPaths.Contains(path) || imgPath.Equals(tagImgPath));
+                    bool isSameImage = (tagPaths.Contains(path) || imgPath == tagImgPath);
                     if ((isNullImg && tagType == ImageType.NULL) ||
                         (isSameImage && imgCache[i].Width == width && imgCache[i].Height == height))
                     {
@@ -1114,20 +1267,31 @@ namespace VideosLibraryPlugin
             }
 
 
-            Thread.Sleep(0);
+            if (sleep) Thread.Sleep(0);
 
 
             if (img == null)
             {
+                start_ = DateTime.Now;
+
+                if (sleep)
+                {
                 FileStream fstream = new FileStream(imgPath, FileMode.Open);
                 byte[] buffer = new byte[fstream.Length];
+                //for (int read = 0; read != buffer.Length; Thread.Sleep(0))
+                    //read += fstream.Read(buffer, read, Math.Min(64 * 1024, buffer.Length - read));
                 for (int read = 0; read != buffer.Length; Thread.Sleep(0))
+                {
                     read += fstream.Read(buffer, read, Math.Min(64 * 1024, buffer.Length - read));
+                    Logger.Verbose("__ReadImageTime: " + DateTime.Now.Subtract(start_).TotalMilliseconds);
+                    start_ = DateTime.Now;
+                }
                 fstream.Close();
                 img = new Bitmap(new MemoryStream(buffer));
+                }
 
-                //img = new Bitmap(imgPath);
-
+                else
+                    img = new Bitmap(imgPath);
 
                 /*
                 var memStream = new MemoryStream();
@@ -1154,17 +1318,20 @@ namespace VideosLibraryPlugin
 
 
 
-            Thread.Sleep(0);
+            if (sleep) Thread.Sleep(0);
 
 
 
             var tag = (ImageInfo)img.Tag;
             if (tag.ValX > 0 || tag.ValY > 0)
             {
+                //The image is positioned within a frame, extract it.
                 int cloneWidth = img.Width - tag.ValX * 2;
                 int cloneHeight = img.Height - tag.ValY * 2;
                 var cloneRect = new Rectangle(tag.ValX, tag.ValY, cloneWidth, cloneHeight);
-                img = img.Clone(cloneRect, img.PixelFormat);
+                var cloneImg = img.Clone(cloneRect, img.PixelFormat);
+                img.Dispose();
+                img = cloneImg;
             }
             float tmpRatio = (float)width / height;
             float imgRatio = (float)img.Width / img.Height;
@@ -1181,10 +1348,11 @@ namespace VideosLibraryPlugin
                 ? InterpolationMode.HighQualityBicubic : InterpolationMode.Bilinear);
             g.DrawImage(img, xPos, yPos, newWidth, newHeight);
             g.Dispose();
+            img.Dispose();
 
 
 
-            Thread.Sleep(0);
+            if (sleep) Thread.Sleep(0);
 
 
 
@@ -1201,14 +1369,22 @@ namespace VideosLibraryPlugin
 
                 imgCache.RemoveAll(x =>
                     imgCache.Count > IMG_CACHE_LEN &&
+                    (((ImageInfo)x.Tag).ImgPath != upImgPath) &&
+                    (((ImageInfo)x.Tag).ImgPath != fileImgPath) &&
+                    (((ImageInfo)x.Tag).ImgPath != folderImgPath) &&
+                    (((ImageInfo)x.Tag).Type != ImageType.NULL) &&
                     (((ImageInfo)x.Tag).Type == ImageType.FILE_IMAGE ||
                     ((ImageInfo)x.Tag).Type == ImageType.FOLDER_IMAGE));
 
                 imgCache.RemoveAll(x =>
                     imgCache.Count > IMG_CACHE_LEN &&
+                    (((ImageInfo)x.Tag).ImgPath != upImgPath) &&
+                    (((ImageInfo)x.Tag).ImgPath != fileImgPath) &&
+                    (((ImageInfo)x.Tag).ImgPath != folderImgPath) &&
                     ((ImageInfo)x.Tag).Type != ImageType.NULL);
 
 
+                //DISPOSE ON REMOVE?
 
 
                 /*
@@ -1236,8 +1412,9 @@ namespace VideosLibraryPlugin
             if (dbg) Logger.Verbose("__finished loading: " + imgPath + ", " + width + "x" + height);
 
             doNeedRendering = true;
-            GC.Collect();
+            //GC.Collect();
         }
+
 
 
 
@@ -1275,9 +1452,14 @@ namespace VideosLibraryPlugin
             int dirCount = 0;
             int origCount = entryModel.Count;
             bool doBracket = bracketDirNames && !entryModel.AtTopConfigDir();
-            foreach (var dir in new DirectoryInfo(cwd).GetDirectories())
+            IEnumerable<DirectoryInfo> dirs =
+                (GetPathInfos(cwd) ?? new List<FileSystemInfo>()).OfType<DirectoryInfo>();
+            IEnumerable<FileInfo> files =
+                (GetPathInfos(cwd) ?? new List<FileSystemInfo>()).OfType<FileInfo>();
+
+            foreach (var dir in dirs)
             {
-                if (!IsValidDir(dir.FullName, entryModel.FileExtensions, onlyDirsWithVids))
+                if (!IsValidDir(dir, entryModel.FileExtensions, false))
                     continue;
                 else if (dir.Name.Equals("VIDEO_TS"))
                 {
@@ -1297,7 +1479,6 @@ namespace VideosLibraryPlugin
                 else dirCount += GetEntries(dir.FullName, false);
             }
 
-            var files = new DirectoryInfo(cwd).GetFiles();
             foreach (var file in files)
             {
                 if (file.Name.Equals("gbpvr.link"))
@@ -1327,7 +1508,7 @@ namespace VideosLibraryPlugin
                 {
                     var lnk = new IWshRuntimeLibrary.WshShellClass().CreateShortcut(file.FullName);
                     string target = ((IWshRuntimeLibrary.IWshShortcut)lnk).TargetPath;
-                    if (!IsValidDirOrFile(target, entryModel.FileExtensions, onlyDirsWithVids))
+                    if (!IsValidPath(target, entryModel.FileExtensions, false))
                         continue;
                     bool isDirLink = Directory.Exists(target);
                     var type = (isDirLink ? EntryType.FOLDER : EntryType.FILE);
@@ -1335,7 +1516,7 @@ namespace VideosLibraryPlugin
                     var entry = new Entry() { Type = type, Name = name, Created = file.CreationTime, IsLink = true };
                     entryModel.Insert((isDirLink ? dirCount++ : entryModel.Count), target, entry);
                 }
-                else if (IsValidFile(file.FullName, entryModel.FileExtensions))
+                else if (IsValidFile(file, entryModel.FileExtensions))
                 {
                     string name = (entryModel.ShowExtensions ? Path.GetFileName(file.FullName)
                         : Path.GetFileNameWithoutExtension(file.FullName));
@@ -1417,13 +1598,13 @@ namespace VideosLibraryPlugin
         /// </summary>
         protected void HandleCommand(Command cmd)
         {
+            ////////////////////////////////////////////////////////////////////////////////////////////entryModel locking?
             Logger.Verbose("VideosLibrary::handleCommand; " + cmd + ", idx " + entryModel.CurrentIndex);
 
             int selected = entryModel.CurrentIndex;
             string path = entryModel[selected].Key;
             var entry = entryModel[selected].Value;
 
-            ////////////////////////////////////////////////////////////////////////////////////////////entryModel locking?
             if (cmd == Command.PLAY)
             {
                 entry.Status = playbackCache[path] = Playback.NULL;
@@ -1440,7 +1621,7 @@ namespace VideosLibraryPlugin
                 {
                     bool reload = entryModel.NeedsReloading = true;
                     if ((reload = (entry.Type == EntryType.UP))) entryModel.PopLevel();
-                    else if ((reload = (Directory.Exists(path)))) entryModel.PushLevel(path);
+                    else if ((reload = (IsValidDir(path, null, true)))) entryModel.PushLevel(path);
                     if (reload)
                     {
                         WatcherInit(path);
@@ -1544,14 +1725,15 @@ namespace VideosLibraryPlugin
             ImageType imgType = imgTypes.First(x => x.Value.Equals(name)).Key;
             bool isUpImg = Boolean.Parse(parameters[UP_ENTRY_KEY].ToString());
             string path = parameters["path"].ToString();
-            string searchPath = (isUpImg ? upImgPath : path);
+            string searchPath = (isUpImg ? upImgPath: path) ?? "NULL.JPG";
+
             Image img = GetCachedImage(searchPath, width, height, null);
             if (img == null)
             {
                 lock (imgRequests)
                 {
                     var info = new ImageInfo(searchPath, null, imgType, width, height);
-                    if (imgRequests.Count == 0 || !imgRequests[0].Equals(info))
+                    if (imgRequests.Count(x => x.Equals(info)) == 0)
                     {
                         imgRequests.RemoveAll(x => x.Equals(info));
                         imgRequests.Insert(0, info);
@@ -1639,7 +1821,7 @@ namespace VideosLibraryPlugin
         public override ArrayList GetRenderList()
         {
             var list = base.GetRenderList();
-            if (!activated) return list;
+            if (!activated || entryModel.Count == 0) return list;
 
             var parameters = new Hashtable();
             bool isFolder = (entryModel.CurrentIndex < entryModel.GetFolderCount());
@@ -1701,6 +1883,7 @@ namespace VideosLibraryPlugin
             double elapsed = DateTime.Now.Subtract(entryModel.LastReload).TotalSeconds;
             bool isShuffled = (entryModel.Sorting == SortMethod.SHUFFLE);
             entryModel.NeedsReloading |= (elapsed > RELOAD_TIMEOUT && !isShuffled);
+            //REFRESH FILESYSTEM CACHE IF TIMEOUT
 
             bool doPopulate = (entryModel.NeedsRefreshing || entryModel.NeedsReloading);
             doRender = doRender || doNeedRendering || doPopulate;
@@ -1755,17 +1938,23 @@ namespace VideosLibraryPlugin
                     }
                     Monitor.Pulse(entryModel);
                 }
-            }
-            else
-            {
-                entryModel.CurrentPath = entryModel[entryModel.CurrentIndex].Key;
-                entryModel.CurrentEntry = entryModel[entryModel.CurrentIndex].Value;
+                lock (playbackCache)
+                {
+                    foreach (var pair in entryModel)
+                    {
+                        string path = pair.Key;
+                        var entry = pair.Value;
+                        if (playbackCache.ContainsKey(path))
+                            entry.Status = playbackCache[path];
+                    }
+                }
             }
 
             //Finish with assignments to the base class.
             base.uiList.setViewMode(UpdatedViewMode());
             base.uiList.setItemList(UpdatedUiList());
-            SelectedItem(base.uiList.getItemList()[entryModel.CurrentIndex]);
+            if (entryModel.Count > 0)
+                SelectedItem(base.uiList.getItemList()[entryModel.CurrentIndex]);
 
             Logger.Verbose("VideosLibrary::PopulateListWidget; " +
                 "bottom, currentIdx, currentPath, selected, count: " +
@@ -1905,8 +2094,7 @@ namespace VideosLibraryPlugin
             }
 
             //Early initialization of base variable.
-            string skinRelPath = Path.Combine(getSkinSubdirectory(), "skin.xml");
-            skinHelper2 = new SkinHelper2(skinRelPath);
+            skinHelper2 = new SkinHelper2(Path.Combine(getSkinSubdirectory(), "skin.xml"));
 
             //Initialize class variables.
             imgCache = new List<Bitmap>();
@@ -1927,16 +2115,19 @@ namespace VideosLibraryPlugin
             dbConnection.ConnectionString = DatabaseHelperFactory.getDbConnectionString();
 
             //Get paths for various skin images.
-            string skinDir = pluginHelper.GetSkinRootDirectory().Replace(@"\skin", @"\skin2");
-            string imgPath = Path.Combine(skinDir, "_CoreImages");
+            string skinRoot = pluginHelper.GetSkinRootDirectory().Replace(@"\skin", @"\skin2");
+            string imgPath = Path.Combine(skinRoot, "_CoreImages");
             upImgPath = Path.Combine(imgPath, "Folder-Up.png");
             fileImgPath = Path.Combine(imgPath, "Video-File.png");
             folderImgPath = Path.Combine(imgPath, "Video-Folder.png");
+            if (!File.Exists(upImgPath)) upImgPath = null;
+            if (!File.Exists(fileImgPath)) fileImgPath = null;
+            if (!File.Exists(folderImgPath)) folderImgPath = null;
 
             //Assign configuration values to both member variables and options map.
-            bool slick = Regex.IsMatch(skinDir, @"skin2\\slick", RegexOptions.IgnoreCase);
+            bool slick = Regex.IsMatch(skinRoot, @"skin2\\slick", RegexOptions.IgnoreCase);
             options = InitOptions(pluginHelper.GetConfiguration());
-            options["ShowPlay"] = showMode = (showMode && !slick);
+            options["ShowMode"] = showMode = (showMode && !slick);
 
             //Load translations for button text.
             if (showPlay) commands.Add(MakePair(Command.PLAY, skinHelper2.getTranslation("Play")));
