@@ -495,15 +495,30 @@ namespace VideosLibraryPlugin
 
 
         /// <summary>
-        /// Retrieves a column value from the specified table and row.
+        /// Retrieves the columns for each row matching the given criteria.
         /// </summary>
-        protected static object GetDbValue(string colKey, string table, string row)
+        protected static Dictionary<string, Dictionary<string, object>>
+            GetDbValues(string table, string row, string like)
         {
+            var values = new Dictionary<string, Dictionary<string, object>>();
             if (dbConnection.State != ConnectionState.Open)
-                return DBNull.Value;
-            DbCommand command = dbConnection.CreateCommand();
-            command.CommandText = "SELECT " + colKey + " FROM " + table + " WHERE " + row;
-            return command.ExecuteScalar();
+                return values;
+            using (var cmd = dbConnection.CreateCommand())
+            {
+                cmd.CommandText = "SELECT * FROM " + table + " WHERE " + row + " LIKE " + like;
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        string rowMatch = reader[row].ToString();
+                        if (!values.ContainsKey(rowMatch))
+                            values[rowMatch] = new Dictionary<string,object>();
+                        for (int i = 0; i < reader.FieldCount; ++i)
+                            values[rowMatch].Add(reader.GetName(i), reader.GetValue(i));
+                    }
+                }
+            }
+            return values;
         }
 
 
@@ -512,13 +527,28 @@ namespace VideosLibraryPlugin
         /// </summary>
         protected static Playback GetPlaybackStatus(string path)
         {
+            string dir = Path.GetDirectoryName(path);
+            string relPath = Path.GetFileName(path);
             string table = "PLAYBACK_POSITION";
-            string row = "filename=\"" + path + "\"";
-            object posObj = GetDbValue("last_position", table, row);
-            object endObj = GetDbValue("duration", table, row);
-            int pos = (posObj is DBNull ? 0 : Convert.ToInt32(posObj));
-            int end = (endObj is DBNull ? -1 : Convert.ToInt32(endObj));
+            string row = "filename";
+            string like = "\"%" + relPath + "\"";
+            var vals = GetDbValues(table, row, like);
+            while (dir != null && vals.Count(x => x.Key.Contains(relPath)) > 1)
+            {
+                string parent = Path.GetFileName(dir);
+                if (String.IsNullOrEmpty(parent)) parent = dir;
+                relPath = Path.Combine(parent, relPath);
+                dir = Path.GetDirectoryName(dir);
+            }
 
+            int pos = 0;
+            int end = -1;
+            if (vals.Count(x => x.Key.Contains(relPath)) > 0)
+            {
+                var cols = vals.First(x => x.Key.Contains(relPath)).Value;
+                pos = Convert.ToInt32(cols["last_position"]);
+                end = Convert.ToInt32(cols["duration"]);
+            }
             float pad = WATCHED_PADDING;
             if (end >= pos && end - pos <= pad) return Playback.FINISHED;
             else if (pos >= pad) return Playback.WATCHING;
@@ -1587,7 +1617,7 @@ namespace VideosLibraryPlugin
             if (!resume)
             {
                 try { PlayVideoFile(path, 0); }
-                catch (MissingMethodException e) { resume = true; }
+                catch (MissingMethodException) { resume = true; }
             }
             if (resume) pluginHelper.PlayVideoFile(path);
         }
@@ -1619,16 +1649,22 @@ namespace VideosLibraryPlugin
                     PlayVideoFile(path, (entry.Status != Playback.UNWATCHED));
                 else
                 {
-                    bool reload = entryModel.NeedsReloading = true;
-                    if ((reload = (entry.Type == EntryType.UP))) entryModel.PopLevel();
-                    else if ((reload = (IsValidDir(path, null, true)))) entryModel.PushLevel(path);
-                    if (reload)
+                    entryModel.NeedsReloading = true;
+                    if (entry.Type == EntryType.UP)
+                        entryModel.PopLevel();
+                    else if (IsValidDir(path, entryModel.FileExtensions, true))
+                        entryModel.PushLevel(path);
+                    else entryModel.NeedsReloading = false;
+
+                    if (entryModel.NeedsReloading)
                     {
-                        WatcherInit(path);
                         PopulateListWidget();
+                        WatcherInit(path);
                         lock (imgRequests) imgRequests.Clear();
                     }
-                    entryModel.NeedsRefreshing = entryModel.NeedsReloading = false;
+                    entry.NeedsRefreshing = false;
+                    entryModel.NeedsRefreshing = false;
+                    entryModel.NeedsReloading = false;
                 }
             }
             else if (cmd == Command.MODE)
@@ -1986,13 +2022,7 @@ namespace VideosLibraryPlugin
             bool atTopDir = entryModel.AtTopDir();
             bool isPopup = (base.activePopup != null);
 
-            if (false && e.Modifiers == 0 && 'A' <= e.KeyValue && e.KeyValue <= 'Z')
-            {
-                string letter = ((char)e.KeyValue).ToString();
-                int idx = entryModel.FindIndex(x => x.Value.Name.StartsWith(letter));
-                if (idx != -1) SelectedItem(base.uiList.getItemList()[idx]);
-            }
-            else if (mapping.Equals("LIBRARY_FASTFORWARD") || mapping.Equals("LIBRARY_SKIP_FORWARDS"))
+            if (mapping.Equals("LIBRARY_FASTFORWARD") || mapping.Equals("LIBRARY_SKIP_FORWARDS"))
             {
                 SelectedItem(base.uiList.getItemList()[entryModel.Count - 1]);
             }
