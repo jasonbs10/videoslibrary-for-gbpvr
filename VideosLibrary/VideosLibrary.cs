@@ -546,8 +546,10 @@ namespace VideosLibraryPlugin
             if (vals.Count(x => x.Key.Contains(relPath)) > 0)
             {
                 var cols = vals.First(x => x.Key.Contains(relPath)).Value;
-                pos = Convert.ToInt32(cols["last_position"]);
-                end = Convert.ToInt32(cols["duration"]);
+                var dbPos = cols["last_position"];
+                var dbEnd = cols["duration"];
+                if (!(dbPos is DBNull)) pos = Convert.ToInt32(dbPos);
+                if (!(dbEnd is DBNull)) end = Convert.ToInt32(dbEnd);
             }
             float pad = WATCHED_PADDING;
             if (end >= pos && end - pos <= pad) return Playback.FINISHED;
