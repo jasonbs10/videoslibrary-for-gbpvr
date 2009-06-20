@@ -42,8 +42,10 @@ namespace VideosLibraryPlugin
         protected const int IMG_CACHE_LEN = 50;
         protected const float RELOAD_TIMEOUT = 180;
         protected const float WATCHED_PADDING = 10;
-        protected const string UP_ENTRY_KEY = "upEntry";
+        protected const string IS_VALID_KEY = "isValid";
+        protected const string IS_CACHED_KEY = "isCached";
         protected const string IMG_PATH_KEY = "imagePath";
+        protected const string ENTRY_TYPE_KEY = "entryType";
         protected const string RERENDER_KEY = "FORCE_RERENDER";
         protected const string REG_VIEW_NAME = "VideoLibraryView";
         protected const string REG_SORT_NAME = "VideoLibrarySort";
@@ -69,6 +71,7 @@ namespace VideosLibraryPlugin
         protected GBPVRUiElement statusUi = null;
         protected GBPVRUiElement summaryUi = null;
         protected GBPVRUiElement coverUi = null;
+        protected GBPVRUiElement backgroundUi = null;
 
         protected List<Bitmap> imgCache = null;
         protected List<ImageInfo> imgRequests = null;
@@ -87,8 +90,8 @@ namespace VideosLibraryPlugin
         protected enum EntryType { NULL, UP, DVD, FOLDER, FILE }
         protected enum SortMethod { ALPHA_NUMERIC, CREATION, SHUFFLE }
         protected enum Playback { NULL, UNWATCHED, WATCHING, FINISHED }
-        protected enum ImageType { NULL, PREVIEW, FILE_IMAGE, FOLDER_IMAGE }
         protected enum Command { PLAY, MODE, SORT, PLAY_ALL, DELETE, MAIN_MENU }
+        protected enum ImageType { NULL, BACKGROUND, PREVIEW, FILE_IMAGE, FOLDER_IMAGE }
 
 
         
@@ -99,6 +102,8 @@ namespace VideosLibraryPlugin
         static protected string picExtensions = @"^.+\.(bmp|jpg|png|tiff)$";
         static Dictionary<string, List<FileSystemInfo>> fileSystemCache =
             new Dictionary<string, List<FileSystemInfo>>();
+        static Dictionary<string, Hashtable> xmlCache = new Dictionary<string, Hashtable>();
+        protected volatile bool getXmlMetadata = false;
 
 
 
@@ -145,13 +150,15 @@ namespace VideosLibraryPlugin
                 Type = EntryType.NULL; 
                 Status = Playback.NULL;
                 Created = DateTime.MinValue;
-                NeedsRefreshing = true;
+                Properties = new Hashtable();
+                NeedsRefreshing = false;
             }
             public string Name { get; set; }
             public bool IsLink { get; set; }
             public EntryType Type { get; set; }
             public Playback Status { get; set; }
             public DateTime Created { get; set; }
+            public Hashtable Properties { get; set; }
             public bool NeedsRefreshing { get; set; }
         }
 
@@ -616,6 +623,7 @@ namespace VideosLibraryPlugin
 
 
         /// <summary>
+        /// Only called by GetPathInfos() and GetPathInfo().
         /// Make sure directory contents are cached then return them.
         /// If the directory can't be read then null is returned.
         /// </summary>
@@ -633,6 +641,10 @@ namespace VideosLibraryPlugin
                     Logger.Verbose("VideosLibrary::GetPathInfosImpl; " + e.Message);
                     fileSystemCache[dir] = null;
                 }
+                foreach (var info in fileSystemCache[dir] ?? new List<FileSystemInfo>())
+                {
+                    //bool dummy = info.Exists;
+                }
                 return fileSystemCache[dir];
             }
         }
@@ -647,7 +659,8 @@ namespace VideosLibraryPlugin
             var info = GetPathInfo(path);
             if (info is FileInfo)
                 info = GetPathInfo(Path.GetDirectoryName(info.FullName));
-            return GetPathInfosImpl(info.FullName);
+            var infos = GetPathInfosImpl(info.FullName);
+            return (infos != null ? new List<FileSystemInfo>(infos) : null);
         }
 
 
@@ -661,10 +674,17 @@ namespace VideosLibraryPlugin
                 return new DirectoryInfo(path);
 
             ICollection<FileSystemInfo> infos = GetPathInfosImpl(dir);
-            if (infos != null && CheckPath(path, infos) == null)
-                infos.Add(new FileInfo(path));
-            return (infos == null ? new FileInfo(path) 
-                : infos.First(x => x.FullName == path));
+            lock (fileSystemCache)
+            {
+                if (infos != null && CheckPath(path, infos) == null)
+                {
+                    var info = new FileInfo(path);
+                    //bool dummy = info.Exists;
+                    infos.Add(info);
+                    return info;
+                }
+                return (infos == null ? new FileInfo(path) : infos.First(x => x.FullName == path));
+            }
         }
 
 
@@ -756,6 +776,37 @@ namespace VideosLibraryPlugin
                 : IsValidDir((DirectoryInfo)info, fileRegex, checkRead));
         }
 
+
+        /// <summary>
+        /// Set the path to null if invalid or update it if it represents a dvd.
+        /// Returns true if the path represents a file or dvd.
+        /// </summary>
+        protected static bool SetCanonicalPath(ref string path, string fileRegex)
+        {
+            var info = GetPathInfo(path);
+            bool isDir = (info is DirectoryInfo);
+            bool isValid = IsValidPath(info, fileRegex, true);
+            string dvdPath = Path.Combine(path, "VIDEO_TS");
+            if (isValid && isDir && Path.GetFileName(path).Equals("VIDEO_TS"))
+            {
+                path = Path.GetDirectoryName(path);
+                path = Path.Combine(path, Path.GetFileName(path)) + ".dvd_";
+                return true;
+            }
+            else if (isValid && isDir && GetPathInfo(dvdPath).Exists)
+            {
+                string origDvdPath = dvdPath;
+                bool isFile = SetCanonicalPath(ref dvdPath, fileRegex);
+                if (origDvdPath != dvdPath) path = dvdPath;
+                return isFile;
+            }
+            else if (!isValid)
+                path = null;
+
+            return !isDir;
+        }
+
+
         /// <summary>
         /// Find an xml file for the given video file or directory.
         /// If strict, only allow folder.xml for directories.
@@ -763,19 +814,8 @@ namespace VideosLibraryPlugin
         /// </summary>
         protected static string FindXmlFile(string path, string fileRegex, bool strict)
         {
-            if (!IsValidPath(path, fileRegex, true))
-                return null;
-
-            bool isFile = (GetPathInfo(path) is FileInfo);
-            string dvdPath = Path.Combine(path, "VIDEO_TS");
-            if (!isFile && Directory.Exists(dvdPath))
-                return FindXmlFile(dvdPath, fileRegex, strict);
-            else if (!isFile && Path.GetFileName(path).Equals("VIDEO_TS"))
-            {
-                isFile = true;
-                path = Path.GetDirectoryName(path);
-                path = Path.Combine(path, Path.GetFileName(path)) + ".dvd_";
-            }
+            bool isFile = SetCanonicalPath(ref path, fileRegex);
+            if (path == null) return null;
 
             string xmlPath = null;
             string dir = (isFile ? Path.GetDirectoryName(path) : path);
@@ -812,19 +852,8 @@ namespace VideosLibraryPlugin
         /// </summary>
         protected static string FindCoverArt(string path, string fileRegex, bool strict)
         {
-            if (!IsValidPath(path, fileRegex, true))
-                return null;
-
-            bool isFile = (GetPathInfo(path) is FileInfo);
-            string dvdPath = Path.Combine(path, "VIDEO_TS");
-            if (!isFile && Directory.Exists(dvdPath))
-                return FindCoverArt(dvdPath, fileRegex, strict);
-            else if (!isFile && Path.GetFileName(path).Equals("VIDEO_TS"))
-            {
-                isFile = true;
-                path = Path.GetDirectoryName(path);
-                path = Path.Combine(path, Path.GetFileName(path)) + ".dvd_";
-            }
+            bool isFile = SetCanonicalPath(ref path, fileRegex);
+            if (path == null) return null;
 
             string imgPath = null;
             var metadata = new Hashtable();
@@ -858,23 +887,33 @@ namespace VideosLibraryPlugin
 
 
         /// <summary>
-        /// Return known tag|metadata pairs from the provided xml file.
+        /// Fill table with tag|metadata pairs from the provided xml file and return status.
         /// </summary>
-        protected static bool GetXmlMetadata(Hashtable metadata, string xmlPath)
+        protected static bool GetXmlMetadata(Hashtable properties, string xmlPath)
         {
-            if (File.Exists(xmlPath))
+            Hashtable metadata = null;
+            if (xmlPath == null)
+             return (bool)(properties[IS_VALID_KEY] = false);
+            else if (xmlCache.ContainsKey(xmlPath))
+                metadata = xmlCache[xmlPath];
+            else
             {
+                metadata = xmlCache[xmlPath] = new Hashtable() { { IS_VALID_KEY, false } };
                 var doc = new XmlDocument();
-                try { doc.Load(xmlPath); }
-                catch (Exception e) { Logger.Error(e.Message); }
+                if (File.Exists(xmlPath))
+                {
+                    try { doc.Load(xmlPath); metadata[IS_VALID_KEY] = true; }
+                    catch (Exception e) { Logger.Error(e.Message); }
+                }
                 metadata["@genre"] = GetSingle(doc, "/Title/Genres", "");
                 metadata["@title"] = GetSingle(doc, "/Title/LocalTitle", "");
                 metadata["@duration"] = GetSingle(doc, "/Title/RunningTime", "");
                 metadata["@description"] = GetSingle(doc, "/Title/Description", "");
                 metadata[IMG_PATH_KEY] = GetSingle(doc, "/Title/Covers/Front", "");
-                return true;
             }
-            return false;
+            foreach (var key in metadata.Keys)
+                properties[key] = metadata[key];
+            return ((bool)metadata[IS_VALID_KEY]);
         }
 
 
@@ -1018,30 +1057,37 @@ namespace VideosLibraryPlugin
 
         /// <summary>
         /// Assign a new ui element if null and update it based on the current skin.
+        /// Returns true if the element was updated and added to the list.
+        /// Parameters is updated with IS_CACHED_KEY if an image was retrieved from the cache.
+        /// Parameters is updated with IS_VALID_KEY to indicate if ui is defined by the skin.
         /// </summary>
-        protected void AddUiElement(ArrayList list, Hashtable parameters, ref GBPVRUiElement ui)
+        protected bool AddUiElement(ArrayList list, Hashtable parameters, ref GBPVRUiElement ui)
         {
             string name = Convert.ToString(parameters["name"]);
-            decimal alpha = (parameters.ContainsKey("alpha"))
-                ? Convert.ToDecimal(parameters["alpha"]) : 255;
             bool hasRect = skinHelper2.checkPlacementRectDefined(name);
             bool hasImg = skinHelper2.checkCompositeImageDefined(name);
+            bool isValid = (hasRect && hasImg && !(ui != null && ui.alpha == 0));
+            if (!parameters.ContainsKey(IS_VALID_KEY))
+                parameters[IS_VALID_KEY] = isValid;
+            parameters[IS_CACHED_KEY] = false;
+            isValid &= (bool)parameters[IS_VALID_KEY];
 
             //CHECK SKIN FOR INSET FLAG?
 
-            if (hasRect && hasImg)
+            if (isValid)
             {
-                var img = skinHelper2.getNamedImage(name, parameters);
-                var rect = skinHelper2.getPlacementRect(name);
-                if (ui != null) ui.image = img;
-                else ui = new GBPVRUiElement(name, rect, img);
-                bool render = (alpha != ui.alpha);
-                doNeedRendering |= render;
-                ui.forceRefresh = true;
-                ui.alpha = (int)alpha;
-                list.Add(ui);
+                if (ui == null) ui = new GBPVRUiElement(name, RectangleF.Empty, null);
+                ui.image = skinHelper2.getNamedImage(name, parameters);
+                ui.SetRect(skinHelper2.getPlacementRect(name));
+                if ((isValid = (bool)parameters[IS_VALID_KEY]))
+                {
+                    ui.forceRefresh = true;
+                    list.Add(ui);
+                }
+                else ui.image = null;
+                parameters[IS_VALID_KEY] = true;
             }
-            parameters.Clear();
+            return isValid;
         }
 
 
@@ -1061,6 +1107,7 @@ namespace VideosLibraryPlugin
                 var mode = (UiList.ViewMode)Enum.Parse(typeof(UiList.ViewMode), viewStr);
                 viewModeModified = (onlyFolders && mode != ViewMode.MODE_ICON);
                 viewModeModified |= (!onlyFolders && mode != ViewMode.MODE_LIST);
+                getXmlMetadata = (mode == ViewMode.MODE_DETAILS);
                 return mode;
             }
         }
@@ -1083,15 +1130,18 @@ namespace VideosLibraryPlugin
                 string textStyle = GetTextStyle(path, entry.Status, mode);
 
                 Hashtable properties = new Hashtable();
+                properties.Add("@description", "");
                 properties.Add("@textStyle", textStyle);
                 properties.Add("@folderName", entry.Name);
                 properties.Add("@fileName", entry.Name);
                 properties.Add("@name", entry.Name);
                 properties.Add("path", path);
+                properties.Add(ENTRY_TYPE_KEY, entry.Type);
                 properties.Add(imgTypes[ImageType.PREVIEW], this);
                 properties.Add(imgTypes[ImageType.FILE_IMAGE], this);
                 properties.Add(imgTypes[ImageType.FOLDER_IMAGE], this);
-                properties.Add(UP_ENTRY_KEY, (entry.Type == EntryType.UP));
+                foreach (var key in entry.Properties.Keys)
+                    properties[key] = entry.Properties[key];
 
                 //Workaround to bypass GBPVR image caching.
                 properties[path] = (imgIds.ContainsKey(path)
@@ -1108,35 +1158,59 @@ namespace VideosLibraryPlugin
 
 
         /// <summary>
-        /// Find an unitialized entry in the given entryModel range and update with db info.
+        /// Helper; gets metadata and watched status for a single entry in entryModel.
         /// </summary>
-        protected bool ReadDbSingle(int start, int count)
+        protected void GetEntryInfo(string path, Entry entry, bool inView)
         {
-            bool foundNull = false;
-            int end = start + count - 1;
-            int dirCount = entryModel.GetFolderCount();
-            for (int i = Math.Max(dirCount, start); i <= end && !foundNull; ++i)
+            if (entry.Type == EntryType.UP)
+                return;
+            if (getXmlMetadata && inView && entry.Properties.Count == 0)
+            {
+                string xml = FindXmlFile(path, entryModel.FileExtensions, false);
+                entry.NeedsRefreshing |= GetXmlMetadata(entry.Properties, xml);
+            }
+            if (entry.Type == EntryType.FILE || entry.Type == EntryType.DVD)
             {
                 lock (playbackCache)
                 {
-                    string path = entryModel[i].Key;
-                    var entry = entryModel[i].Value;
-                    foundNull = (entry.Status == Playback.NULL);
+                    bool foundNull = (entry.Status == Playback.NULL);
                     foundNull &= (!playbackCache.ContainsKey(path) || playbackCache[path] == Playback.NULL);
                     if (foundNull) entry.Status = playbackCache[path] = GetPlaybackStatus(path);
                     else entry.Status = playbackCache[path];
+                    entry.NeedsRefreshing |= foundNull;
                 }
             }
-            return foundNull;
         }
 
 
         /// <summary>
-        /// Loop, finding all unitialized entries in entryModel and updating with db info.
+        /// Loop, getting metadata and watched status for all entries in entryModel.
         /// Passed to threads as an action.
         /// </summary>
-        protected void ReadDbInfo()
+        protected void GetEntryInfos()
         {
+            var idxs = new List<int>();
+            var UpdateIdxs = new Func<List<int>, bool, bool>((list, doInit) =>
+            {
+                bool inView = false;
+                int viewCount = viewCounts[base.uiList.getViewMode()];
+                int top = Math.Max(0, entryModel.BottomIndex - viewCount);
+                if (doInit)
+                    list.Clear();
+                for (int i = 0; i < entryModel.Count && doInit; ++i)
+                    list.Add(i);
+                for (int i = entryModel.BottomIndex; i >= top ; --i)
+                {
+                    if (doInit || list.Contains(i))
+                    {
+                        list.Remove(i);
+                        list.Insert(0, i);
+                        inView = true;
+                    }
+                }
+                return inView;
+            });
+            
             string path;
             while (true)
             {
@@ -1144,23 +1218,25 @@ namespace VideosLibraryPlugin
                 {
                     Monitor.Wait(entryModel);
                     path = entryModel.CurrentPath;
+                    UpdateIdxs(idxs, true);
                 }
 
                 dbConnection.Open();
-                while (path == entryModel.CurrentPath)
+                while (idxs.Count > 0)
                 {
+                    string entryPath;
+                    Entry entry;
+                    bool inView;
                     lock (entryModel)
                     {
-                        if (path == entryModel.CurrentPath)
-                        {
-                            int viewCount = viewCounts[base.uiList.getViewMode()];
-                            int top = entryModel.BottomIndex - viewCount;
-                            if (!ReadDbSingle(top, viewCount) &&
-                                !ReadDbSingle(0, entryModel.Count))
-                                break;
-                        }
+                        if (path != entryModel.CurrentPath)
+                            break;
+                        inView = UpdateIdxs(idxs, false);
+                        entryPath = entryModel[idxs[0]].Key;
+                        entry = entryModel[idxs[0]].Value;
+                        idxs.RemoveAt(0);
                     }
-                    Thread.Sleep(0);
+                    GetEntryInfo(entryPath, entry, inView);
                 }
                 try { dbConnection.Close(); }
                 catch (DbException e) { Logger.Error(e.Message); }
@@ -1222,7 +1298,13 @@ namespace VideosLibraryPlugin
             bool isDvd = Path.GetFileName(path).Equals("VIDEO_TS");
             if (isFile && Regex.IsMatch(path, picExtensions, RegexOptions.IgnoreCase))
                 imgPath = path;
-            if (imgPath == null)
+            if (imgType == ImageType.BACKGROUND)
+            {
+                string dir = entryModel.GetDirectory();
+                var files = GetPathInfos(dir).OfType<FileInfo>();
+                imgPath = GetCongruentFile(path, picExtensions, files);
+            }
+            else if (imgPath == null)
             {
                 /*
                 string dir = (isFile || isDvd ? Path.GetDirectoryName(path) : path);
@@ -1239,6 +1321,7 @@ namespace VideosLibraryPlugin
                 imgPath = FindCoverArt(path, entryModel.FileExtensions, strictFolderMetadata);
 
             }
+
             if (imgPath == null)
                 imgPath = (isFile || isDvd ? fileImgPath : folderImgPath);
             //bool isNullImg = (!File.Exists(imgPath));
@@ -1376,7 +1459,7 @@ namespace VideosLibraryPlugin
 
             var bitmap = new Bitmap(width, height);
             var g = Graphics.FromImage(bitmap);
-            g.InterpolationMode = (imgType == ImageType.PREVIEW
+            g.InterpolationMode = (imgType <= ImageType.PREVIEW
                 ? InterpolationMode.HighQualityBicubic : InterpolationMode.Bilinear);
             g.DrawImage(img, xPos, yPos, newWidth, newHeight);
             g.Dispose();
@@ -1639,10 +1722,6 @@ namespace VideosLibraryPlugin
 
             if (cmd == Command.PLAY)
             {
-                entry.Status = playbackCache[path] = Playback.NULL;
-                entry.NeedsRefreshing = true;
-                entryModel.NeedsRefreshing = true;
-
                 if (entry.Type == EntryType.DVD)
                     pluginHelper.PlayDVDFromDirectory(Path.GetDirectoryName(path));
                 else if (entry.Type == EntryType.FILE && path.EndsWith(".iso"))
@@ -1663,11 +1742,11 @@ namespace VideosLibraryPlugin
                         PopulateListWidget();
                         WatcherInit(path);
                         lock (imgRequests) imgRequests.Clear();
+                        entryModel.NeedsReloading = false;
                     }
-                    entry.NeedsRefreshing = false;
-                    entryModel.NeedsRefreshing = false;
-                    entryModel.NeedsReloading = false;
                 }
+                lock (playbackCache)
+                    entry.Status = playbackCache[path] = Playback.NULL;
             }
             else if (cmd == Command.MODE)
             {
@@ -1675,12 +1754,13 @@ namespace VideosLibraryPlugin
                 int newMode = ((int)base.uiList.getViewMode() + 1) % endMode;
                 var mode = (UiList.ViewMode)newMode;
                 base.uiList.setViewMode(mode);
-                if (mode <= UiList.ViewMode.MODE_DETAILS)
+                if (mode == UiList.ViewMode.MODE_LIST)
                 {
                     lock (imgRequests) imgRequests.Clear();
                     lock (imgCache) imgCache.Clear();
                     GC.Collect();
                 }
+                //getXmlMetadata = (mode == ViewMode.MODE_DETAILS);
                 SetRegData(REG_VIEW_NAME, mode.ToString().Replace("MODE_", ""));
                 entryModel.NeedsRefreshing = true;
                 viewModeModified = true;
@@ -1753,6 +1833,7 @@ namespace VideosLibraryPlugin
 
         /// <summary>
         /// Called by the parent when images are needed for on-screen entries.
+        /// Updates parameters with IS_VALID_KEY and IS_CACHED_KEY.
         /// </summary>
         public virtual Image GetImage(Hashtable parameters, string name, int width, int height)
         {
@@ -1761,10 +1842,16 @@ namespace VideosLibraryPlugin
                 parameters["path"].ToString() + ", " + width + "x" + height);
             
             ImageType imgType = imgTypes.First(x => x.Value.Equals(name)).Key;
-            bool isUpImg = Boolean.Parse(parameters[UP_ENTRY_KEY].ToString());
+            var entryType = (EntryType)(parameters.ContainsKey(ENTRY_TYPE_KEY)
+                ? parameters[ENTRY_TYPE_KEY] : EntryType.NULL);
             string path = parameters["path"].ToString();
-            string searchPath = (isUpImg ? upImgPath: path) ?? "NULL.JPG";
 
+            string searchPath = path;
+            if (entryType == EntryType.UP)
+                searchPath = upImgPath ?? "NULL.JPG";
+            else if (imgType == ImageType.BACKGROUND)
+                searchPath = Path.Combine(entryModel.GetDirectory(), "Background.jpg");
+            
             Image img = GetCachedImage(searchPath, width, height, null);
             if (img == null)
             {
@@ -1779,7 +1866,7 @@ namespace VideosLibraryPlugin
                     }
                 }
             }
-
+            
             var start = DateTime.Now;
             int ms = (imgType == ImageType.PREVIEW ? 25 : 0);
             var timeout = new TimeSpan(0, 0, 0, 0, ms);
@@ -1788,14 +1875,24 @@ namespace VideosLibraryPlugin
                 img = GetCachedImage(searchPath, width, height, timeout);
                 timeout = timeout.Subtract(DateTime.Now.Subtract(start));
             }
+
+            parameters[IS_VALID_KEY] = false;
+            parameters[IS_CACHED_KEY] = false;
             if (img == null)
             {
                 //Workaround to bypass GBPVR image caching.
-                parameters[RERENDER_KEY] = "true";
-                parameters[path] = imgIds[path]++;
+                parameters[RERENDER_KEY] = true;
+                if (imgIds.ContainsKey(path))
+                    parameters[path] = imgIds[path]++;
                 return null;
             }
-            else return (((ImageInfo)img.Tag).Type == ImageType.NULL) ? null : img;
+            else
+            {
+                bool isValid = (((ImageInfo)img.Tag).Type != ImageType.NULL);
+                parameters[IS_VALID_KEY] = isValid;
+                parameters[IS_CACHED_KEY] = true;
+                return (isValid ? img : null);
+            }
         }
 
 
@@ -1866,30 +1963,58 @@ namespace VideosLibraryPlugin
 
             parameters["name"] = "StatusInfo";
             double elapsed = DateTime.Now.Subtract(entryModel.LastManualSort).TotalSeconds;
+            if (statusUi != null) statusUi.alpha = (int)Math.Max(0, 255 - Math.Pow(elapsed, 3));
             string sortingStr = "Sort: " + (
                 (entryModel.Sorting == SortMethod.ALPHA_NUMERIC) ? "AlphaNumeric" :
                 (entryModel.Sorting == SortMethod.CREATION) ? "CreationTime" :
                 (entryModel.Sorting == SortMethod.SHUFFLE) ? "Shuffle" : "?");
-            parameters["alpha"] = Math.Max(0, 255 - (decimal)Math.Pow(elapsed, 3));
             parameters["@" + parameters["name"]] = sortingStr;
-            AddUiElement(list, parameters, ref statusUi);
+            doNeedRendering |= AddUiElement(list, parameters, ref statusUi);
+            parameters.Clear();
 
             parameters["name"] = (isFolder ? "FolderSummary" : "InfoSummary");
-            //TEMP: REDUNDANT SKIN CHECKS TO AVOID UNNEEDED XML SEARCH.
-            if (skinHelper2.checkPlacementRectDefined(parameters["name"].ToString()) &&
-                skinHelper2.checkCompositeImageDefined(parameters["name"].ToString()) &&
-                GetXmlMetadata(parameters, FindXmlFile(entryModel.CurrentPath,
-                                                       entryModel.FileExtensions,
-                                                       strictFolderMetadata)))
-            {
-                AddUiElement(list, parameters, ref summaryUi);
-            }
+            parameters[IS_VALID_KEY] = false;
+            var metadata = entryModel.CurrentEntry.Properties;
+            foreach (var key in metadata.Keys)
+                parameters[key] = metadata[key];
+            AddUiElement(list, parameters, ref summaryUi);
+            parameters.Clear();
 
             parameters["name"] = (isFolder ? "FolderArt" : "CoverArt");
             parameters["path"] = entryModel.CurrentPath;
             parameters[imgTypes[ImageType.PREVIEW]] = this;
-            parameters[UP_ENTRY_KEY] = (entryModel.CurrentEntry.Type == EntryType.UP);
-            AddUiElement(list, parameters, ref coverUi);
+            parameters[ENTRY_TYPE_KEY] = entryModel.CurrentEntry.Type;
+            var IsCoverStale = new Func<bool>(() =>
+                (coverUi == null || !coverUi.name.EndsWith(entryModel.CurrentPath)));
+            if (IsCoverStale() && (AddUiElement(list, parameters, ref coverUi) || (bool)parameters[IS_CACHED_KEY]))
+                coverUi.name = parameters["name"] + "|" + entryModel.CurrentPath;
+            if (!(IsCoverStale() || coverUi.image == null))
+                list.Add(coverUi);
+            getXmlMetadata |= (IsCoverStale() && (bool)parameters[IS_VALID_KEY]);
+            doNeedRendering |= (IsCoverStale() && (bool)parameters[IS_VALID_KEY]);
+            parameters.Clear();
+
+            parameters["name"] = "Background";
+            parameters["path"] = entryModel.GetDirectory();
+            parameters[imgTypes[ImageType.BACKGROUND]] = this;
+            parameters[ENTRY_TYPE_KEY] = entryModel.CurrentEntry.Type;
+            var IsBgStale = new Func<bool>(() =>
+                (backgroundUi == null || backgroundUi.name != entryModel.GetDirectory()));
+            if (IsBgStale() && (AddUiElement(list, parameters, ref backgroundUi) || (bool)parameters[IS_CACHED_KEY]))
+            {
+                list.Remove(backgroundUi);
+                backgroundUi.name = entryModel.GetDirectory();
+            }
+            if (!IsBgStale() && backgroundUi.image != null)
+            {
+                //TEMP SLICK LOGIC.
+                int idx = list.Cast<GBPVRUiElement>().ToList().FindIndex(x =>
+                    (x.name.Contains("background"))) + 1;
+                if (idx > 0) ((GBPVRUiElement)list[idx - 1]).alpha = 75;
+                list.Insert(0, backgroundUi);
+            }
+            doNeedRendering |= (IsBgStale() && (bool)parameters[IS_VALID_KEY]);
+            parameters.Clear();
 
             return list;
         }
@@ -1906,17 +2031,18 @@ namespace VideosLibraryPlugin
             for (int i = 0; i < entryModel.Count; ++i)
             {
                 var entry = entryModel[i].Value;
-                bool isFile = (i >= entryModel.GetFolderCount());
-                if (isFile && entry.NeedsRefreshing && entry.Status != Playback.NULL)
-                {
-                    int viewCount = viewCounts[base.uiList.getViewMode()];
-                    int btm = entryModel.BottomIndex;
-                    int top = btm - (viewCount - 1);
-                    entryModel.NeedsRefreshing |= (top <= i && i <= btm);
-                    entry.NeedsRefreshing = !entryModel.NeedsRefreshing;
-                }
-                else if (isFile && entry.NeedsRefreshing && entry.Status == Playback.NULL)
+                int viewCount = viewCounts[base.uiList.getViewMode()];
+                int btm = entryModel.BottomIndex;
+                int top = btm - (viewCount - 1);
+                bool inView = ((top <= i && i <= btm));
+
+                if (inView && (entry.Properties.Count == 0 || entry.Status == Playback.NULL))
                     lock (entryModel) Monitor.Pulse(entryModel);
+                if (entry.NeedsRefreshing)
+                {
+                    entry.NeedsRefreshing = false;
+                    entryModel.NeedsRefreshing = true;
+                }
             }
             double elapsed = DateTime.Now.Subtract(entryModel.LastReload).TotalSeconds;
             bool isShuffled = (entryModel.Sorting == SortMethod.SHUFFLE);
@@ -2134,6 +2260,7 @@ namespace VideosLibraryPlugin
             imgIds = new Dictionary<string, int>();
             imgTypes = new Dictionary<ImageType, string>()
             {
+                { ImageType.BACKGROUND, "@background" },
                 { ImageType.PREVIEW, "@previewImage" },
                 { ImageType.FILE_IMAGE, "@thumbnail" },
                 { ImageType.FOLDER_IMAGE, "@folderPreviewImage" }
@@ -2173,8 +2300,8 @@ namespace VideosLibraryPlugin
             string sortStr = GetRegData(REG_SORT_NAME, "ALPHA_NUMERIC");
             entryModel.Sorting = (SortMethod)Enum.Parse(typeof(SortMethod), sortStr);
 
-            //Start a thread to retrieve database info.
-            var dbThread = new Thread(ReadDbInfo);
+            //Start a thread to retrieve metadata and database info.
+            var dbThread = new Thread(GetEntryInfos);
             dbThread.Priority = ThreadPriority.Lowest;
             dbThread.IsBackground = true;
             dbThread.Start();
